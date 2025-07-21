@@ -15,6 +15,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/dragonflyoss/nydus/contrib/nydusify/pkg/optimizer"
 
@@ -1410,6 +1411,180 @@ func main() {
 					return errors.Wrap(err, "failed to create committer instance")
 				}
 				return cm.Commit(c.Context, opt)
+			},
+		},
+		{
+			Name:  "seamless-commit",
+			Usage: "Create a seamless snapshot with minimal container pause time",
+			Flags: []cli.Flag{
+				&cli.StringFlag{
+					Name:    "work-dir",
+					Value:   "./tmp",
+					Usage:   "Working directory for commit workflow",
+					EnvVars: []string{"WORK_DIR"},
+				},
+				&cli.StringFlag{
+					Name:    "nydus-image",
+					Value:   "nydus-image",
+					Usage:   "Path to the nydus-image binary, default to search in PATH",
+					EnvVars: []string{"NYDUS_IMAGE"},
+				},
+				&cli.StringFlag{
+					Name:    "containerd-address",
+					Value:   "/run/containerd/containerd.sock",
+					Usage:   "Containerd address, optionally with \"unix://\" prefix [$CONTAINERD_ADDRESS] (default \"/run/containerd/containerd.sock\")",
+					EnvVars: []string{"CONTAINERD_ADDR"},
+				},
+				&cli.StringFlag{
+					Name:    "namespace",
+					Aliases: []string{"n"},
+					Value:   "default",
+					Usage:   "Container namespace, default with \"default\" namespace",
+					EnvVars: []string{"NAMESPACE"},
+				},
+				&cli.StringFlag{
+					Name:     "container",
+					Required: true,
+					Usage:    "Target container ID (supports short ID, full ID)",
+					EnvVars:  []string{"CONTAINER"},
+				},
+				&cli.StringFlag{
+					Name:     "target",
+					Required: true,
+					Usage:    "Target nydus image reference",
+					EnvVars:  []string{"TARGET"},
+				},
+				&cli.BoolFlag{
+					Name:     "source-insecure",
+					Required: false,
+					Usage:    "Skip verifying server certs for HTTPS source registry",
+					EnvVars:  []string{"SOURCE_INSECURE"},
+				},
+				&cli.BoolFlag{
+					Name:     "target-insecure",
+					Required: false,
+					Usage:    "Skip verifying server certs for HTTPS target registry",
+					EnvVars:  []string{"TARGET_INSECURE"},
+				},
+				&cli.StringFlag{
+					Name:    "fs-version",
+					Value:   "6",
+					Usage:   "Nydus image format version number, possible values: 5, 6",
+					EnvVars: []string{"FS_VERSION"},
+				},
+				&cli.StringFlag{
+					Name:    "compressor",
+					Value:   "zstd",
+					Usage:   "Compressor for Nydus image, possible values: none, lz4_block, zstd",
+					EnvVars: []string{"COMPRESSOR"},
+				},
+				&cli.StringSliceFlag{
+					Name:     "with-path",
+					Aliases:  []string{"with-mount-path"},
+					Required: false,
+					Usage:    "The external directory (for example mountpoint) in container that need to be committed",
+					EnvVars:  []string{"WITH_PATH"},
+				},
+				&cli.BoolFlag{
+					Name:     "wait",
+					Required: false,
+					Usage:    "Wait for background commit processing to complete",
+					EnvVars:  []string{"WAIT"},
+				},
+			},
+			Action: func(c *cli.Context) error {
+				setupLogLevel(c)
+				parsePaths := func(paths []string) ([]string, []string) {
+					withPaths := []string{}
+					withoutPaths := []string{}
+
+					for _, path := range paths {
+						path = strings.TrimSpace(path)
+						if strings.HasPrefix(path, "!") {
+							path = strings.TrimLeft(path, "!")
+							path = strings.TrimRight(path, "/")
+							withoutPaths = append(withoutPaths, path)
+						} else {
+							withPaths = append(withPaths, path)
+						}
+					}
+
+					return withPaths, withoutPaths
+				}
+
+				withPaths, withoutPaths := parsePaths(c.StringSlice("with-path"))
+				opt := committer.Opt{
+					WorkDir:           c.String("work-dir"),
+					NydusImagePath:    c.String("nydus-image"),
+					ContainerdAddress: c.String("containerd-address"),
+					Namespace:         c.String("namespace"),
+					ContainerID:       c.String("container"),
+					TargetRef:         c.String("target"),
+					SourceInsecure:    c.Bool("source-insecure"),
+					TargetInsecure:    c.Bool("target-insecure"),
+					FsVersion:         c.String("fs-version"),
+					Compressor:        c.String("compressor"),
+					WithPaths:         withPaths,
+					WithoutPaths:      withoutPaths,
+				}
+				cm, err := committer.NewCommitter(opt)
+				if err != nil {
+					return errors.Wrap(err, "failed to create committer instance")
+				}
+
+				result, err := cm.SeamlessCommit(c.Context, opt)
+				if err != nil {
+					return errors.Wrap(err, "seamless commit failed")
+				}
+
+				fmt.Printf("Seamless snapshot created successfully:\n")
+				fmt.Printf("  Snapshot ID: %s\n", result.SnapshotID)
+				fmt.Printf("  Pause Time: %v\n", result.PauseTime)
+				fmt.Printf("  Old Upper Dir: %s\n", result.OldUpperDir)
+				fmt.Printf("  New Upper Dir: %s\n", result.NewUpperDir)
+				fmt.Printf("Background commit processing started for snapshot: %s\n", result.SnapshotID)
+
+				// If wait flag is set, wait for background processing to complete
+				if c.Bool("wait") {
+					fmt.Printf("Waiting for background commit processing to complete...\n")
+					// Wait for background processing using the completion channel
+					select {
+					case err := <-result.CompleteChan:
+						if err != nil {
+							fmt.Printf("Background processing failed: %v\n", err)
+							return errors.Wrap(err, "background commit processing failed")
+						} else {
+							fmt.Printf("Background processing completed successfully.\n")
+						}
+					case <-time.After(5 * time.Minute): // 5 minute timeout
+						fmt.Printf("Background processing timed out after 5 minutes.\n")
+						return errors.New("background processing timeout")
+					}
+				} else {
+					// Even without --wait, give the background goroutine time to start
+					// and begin processing before the main program exits
+					fmt.Printf("Background processing started. Use --wait to wait for completion.\n")
+
+					// Wait a bit to ensure the goroutine has started and begun processing
+					time.Sleep(3 * time.Second)
+
+					// Check if we can get an early indication of success
+					select {
+					case err := <-result.CompleteChan:
+						if err != nil {
+							fmt.Printf("Background processing failed: %v\n", err)
+							return errors.Wrap(err, "background commit processing failed")
+						} else {
+							fmt.Printf("Background processing completed successfully.\n")
+						}
+					default:
+						// Background processing is still running
+						fmt.Printf("Background processing is running. Check logs for completion status.\n")
+						fmt.Printf("Tip: Use --wait flag to wait for completion in future runs.\n")
+					}
+				}
+
+				return nil
 			},
 		},
 	}
